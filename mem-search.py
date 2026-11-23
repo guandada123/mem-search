@@ -723,6 +723,45 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         shutil.rmtree(fake_home, ignore_errors=True)
         shutil.rmtree(fake_dbd, ignore_errors=True)
 
+    # ---- 交付闸门两条腿（2026-11-23 故障注入：候选集取自库内时，删除类故障结构性不可见）----
+    gate_home = Path(tempfile.mkdtemp(prefix="memsearch-gate-"))
+    gate_db = gate_home / "g.db"
+    try:
+        (gate_home / "WorkBuddy/Claw/.learnings").mkdir(parents=True)
+        long_md = gate_home / "WorkBuddy/Claw/.learnings/long.md"
+        long_md.write_text("# 标题\n正常一行止损\n" + "填" * 2100 + "超时\n", encoding="utf-8")
+        run_index(gate_db, full=True, home=gate_home)
+        conn3 = open_db(gate_db)
+        base_src = _source_match(conn3)
+        check("闸门·源库一致基线", not base_src["bad"] and base_src["skipped"] == 0, str(base_src))
+        base_cover = _sample_self_match(conn3)
+        check("闸门·抽样自匹配基线", base_cover["checked"] > 0 and not base_cover["miss"], str(base_cover))
+
+        # 删掉长行的尾片：源 4 段 → 库 3 段。按库内枚举的旧实现看不见（该行仍在候选集外）
+        conn3.execute(
+            "DELETE FROM chunks WHERE id=(SELECT c.id FROM chunks c JOIN docs d ON d.id=c.doc_id "
+            "WHERE d.path=? AND c.lineno=3 ORDER BY length(c.text) ASC LIMIT 1)",
+            (str(long_md),),
+        )
+        conn3.commit()
+        lost = _source_match(conn3)
+        check("闸门·丢尾片被抓到", bool(lost["bad"]), str(lost["bad"])[:80])
+
+        run_index(gate_db, full=True, home=gate_home)  # 重建，别用增量（mtime/size 未变不会重写）
+        stat0 = long_md.stat()
+        os.utime(long_md, (stat0.st_atime, stat0.st_mtime + 10))
+        stale = _source_match(conn3)
+        check("闸门·源比索引新则跳过不误报",
+              stale["skipped"] == 1 and not stale["bad"], str(stale))
+
+        conn3.execute("UPDATE chunks SET seg=''")  # 行还在、FTS 查不回来
+        conn3.commit()
+        blind = _sample_self_match(conn3)
+        check("闸门·不可检索被抓到", bool(blind["miss"]), str(blind["miss"])[:80])
+        conn3.close()
+    finally:
+        shutil.rmtree(gate_home, ignore_errors=True)
+
     passed = sum(1 for _, ok, _ in checks if ok)
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  [{detail}]" if not ok and detail else ""))
@@ -852,6 +891,10 @@ def _sample_self_match(conn: sqlite3.Connection, n: int = 194, seed: int = 20261
             if df and (best is None or df < best[0]):
                 best = (df, phrase)
         if best is None:
+            # 窗口取自片段自己的 seg，正常情况下必然命中自己（df ≥ 1）。
+            # 全部窗口零命中 = 这行对检索不可见，属于要报的故障，不能当成「样本不可用」跳过。
+            checked += 1
+            miss.append(f"{path}:{lineno}（自身短语零命中）")
             continue
         got = conn.execute(
             "SELECT d.path, c.lineno FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
