@@ -940,7 +940,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
         sl = _source_match(conn)
         conn.close()
         n_ck, n_miss = cover["checked"], cover["miss"]
-        ok = docs > 0 and empty == 0 and n_ck > 0 and not n_miss and not sl["bad"]
+        # 跳过率过高 = 源库比对基本没生效，此时「不符 0」是假绿，必须报红而不是放行
+        skip_ratio = sl["skipped"] / docs if docs else 0.0
+        ok = (docs > 0 and empty == 0 and n_ck > 0 and not n_miss
+              and not sl["bad"] and skip_ratio <= 0.05)
         detail = (
             f"文档 {docs} 篇，0 片段 {empty} 篇，"
             f"抽样自匹配 {n_ck - len(n_miss)}/{n_ck}，"
@@ -948,6 +951,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
         )
         if sl["skipped"]:
             detail += f"（跳 {sl['skipped']} 篇源已更新）"
+        if skip_ratio > 0.05:
+            detail += "；跳过率 >5%，源库比对基本没生效，先 index 再验"
         if n_miss:
             detail += "；漏检 " + "，".join(n_miss[:3])
         if not n_ck:
