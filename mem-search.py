@@ -19,7 +19,8 @@
     similar   写新经验前查重；文本相似度 + 稀有种子覆盖双口径
     stats     索引规模与最新覆盖
     self-test 自检（分词/截断/掉线保护/查重端到端）
-    verify    交付前总闸：自检 + 文档命令与实现一致性 + 索引健康
+    verify    交付前总闸：自检 + 文档命令与实现一致性 + 索引健康 + 版本控制 + 异地副本
+              （--strict：告警项也视为失败，交付前用）
 
 用法:
     mem-search.py index
@@ -30,6 +31,7 @@
     mem-search.py stats
     mem-search.py self-test
     mem-search.py verify
+    mem-search.py verify --strict
 
 退出码: 0 正常 ｜ 1 无命中 / 自检失败 ｜ 2 参数或环境错误
         ｜ 3 索引不完整（目录不可见或文件读不到）｜ 4 查重命中重复
@@ -786,9 +788,43 @@ def _hook_gate_status(root: Path | None) -> tuple[bool, str]:
     return True, "pre-commit → mem-search verify"
 
 
+def _offsite_status(root: Path | None) -> tuple[bool, str]:
+    """异地副本是否同步。判据只用本地 refs（不联网），离线也能跑。
+
+    取「HEAD vs 本地缓存的 origin/main」：一致即已推送。缓存过期的极端情况
+    只会让这一项 ERROR 到 WARN，不会把「从未推送」误判成已备份。
+    """
+    if root is None:
+        return False, "真源不在 git 仓，无法比对远端"
+    url = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True, text=True,
+    )
+    if url.returncode != 0:
+        return False, "无 origin 远端（异地副本不存在，磁盘故障即全丢）"
+    head = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True,
+    ).stdout.strip()
+    remote = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "refs/remotes/origin/main"],
+        capture_output=True, text=True,
+    )
+    rsha = remote.stdout.strip()
+    if remote.returncode != 0 or not rsha:
+        return False, "远端分支未建立（从未推送过）"
+    if head != rsha:
+        ahead = subprocess.run(
+            ["git", "-C", str(root), "rev-list", "--count", f"{rsha}..HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return False, f"本地领先 {ahead or '?'} 个提交未推送"
+    return True, f"origin/main = {head[:7]}"
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
-    """交付前总闸：把「做完了」从主观判断改成五项可执行判据。"""
-    results: list[tuple[str, bool, str]] = []
+    """交付前总闸：把「做完了」从主观判断改成七项可执行判据。"""
+    # (名称, 通过, 详情, 仅告警) —— 仅告警项失败不算交付失败，但要显式打印
+    results: list[tuple[str, bool, str, bool]] = []
 
     # 1) 自检（含分词/截断/掉线保护/查重端到端）
     proc = subprocess.run(
@@ -796,27 +832,27 @@ def cmd_verify(args: argparse.Namespace) -> int:
         capture_output=True, text=True,
     )
     tail = (proc.stdout.strip().splitlines() or ["(无输出)"])[-1]
-    results.append(("self-test 全绿", proc.returncode == 0, tail))
+    results.append(("self-test 全绿", proc.returncode == 0, tail, False))
 
     # 2) 文档命令 vs 实现：SKILL.md 里写的子命令与选项必须真实存在
     skill = Path(args.skill).expanduser()
     if not skill.is_file():
-        results.append(("文档命令可执行", False, f"技能文件不存在: {skill}"))
+        results.append(("文档命令可执行", False, f"技能文件不存在: {skill}", False))
     else:
         calls = _documented_calls(skill)
         bad = _validate_calls(calls)
         results.append((f"技能文档命令可执行（{len(calls)} 条）", bool(calls) and not bad,
-                        "; ".join(bad[:4]) or ("全部存在" if calls else "未解析到任何命令")))
+                        "; ".join(bad[:4]) or ("全部存在" if calls else "未解析到任何命令"), False))
 
     doc_calls = _docstring_calls()
     doc_bad = _validate_calls(doc_calls)
     results.append((f"脚本自带命令可执行（{len(doc_calls)} 条）", bool(doc_calls) and not doc_bad,
-                    "; ".join(doc_bad[:4]) or ("全部存在" if doc_calls else "未解析到命令")))
+                    "; ".join(doc_bad[:4]) or ("全部存在" if doc_calls else "未解析到命令"), False))
 
     # 3) 索引健康：非空 + 无 0 片段文档（0 片段 = 内容对检索不可见，是最隐蔽的假阴性）
     db = Path(args.db).expanduser()
     if not db.exists():
-        results.append(("索引健康", False, "索引库不存在，先跑 index"))
+        results.append(("索引健康", False, "索引库不存在，先跑 index", False))
     else:
         conn = open_db(db)
         docs = conn.execute("SELECT count(*) FROM docs").fetchone()[0]
@@ -825,13 +861,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
         ).fetchone()[0]
         conn.close()
         results.append(("索引健康（非空 + 无空文档）", docs > 0 and empty == 0,
-                        f"文档 {docs} 篇，0 片段 {empty} 篇"))
+                        f"文档 {docs} 篇，0 片段 {empty} 篇", False))
 
     # 4) 真源受版本控制：索引库可重建，脚本不可重建（902 行唯一副本 = 单点故障）
     src = Path(__file__).resolve()
     root = _repo_root_of(src)
     if root is None:
-        results.append(("真源受版本控制", False, f"{src} 不在任何 git 仓"))
+        results.append(("真源受版本控制", False, f"{src} 不在任何 git 仓", False))
     else:
         rel = src.relative_to(root)
         ls = subprocess.run(
@@ -842,17 +878,36 @@ def cmd_verify(args: argparse.Namespace) -> int:
             "真源受版本控制",
             ls.returncode == 0,
             f"{rel} @ {root.name}" if ls.returncode == 0 else f"{rel} 未被 git 跟踪",
+            False,
         ))
 
     # 5) 自动闸门在位：否则「verify 要记得跑」等于没有闸门
     hook_ok, hook_detail = _hook_gate_status(root)
-    results.append(("自动闸门在位", hook_ok, hook_detail))
+    results.append(("自动闸门在位", hook_ok, hook_detail, False))
 
-    passed = sum(1 for _, ok, _ in results if ok)
-    for name, ok, detail in results:
-        print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  [{detail}]" if detail else ""))
-    print(f"\n{passed}/{len(results)} 通过")
-    return 0 if passed == len(results) else 1
+    # 6) 异地副本：git 只防误删，不防磁盘故障；本机 Time Machine 未配置
+    off_ok, off_detail = _offsite_status(root)
+    results.append(("异地副本已同步", off_ok, off_detail, True))
+
+    passed = sum(1 for _, ok, _, _ in results if ok)
+    warned = 0
+    for name, ok, detail, warn_only in results:
+        if ok:
+            tag = "PASS"
+        elif warn_only:
+            tag = "WARN"
+            warned += 1
+        else:
+            tag = "FAIL"
+        print(f"{tag}  {name}" + (f"  [{detail}]" if detail else ""))
+    failed = len(results) - passed - warned
+    if getattr(args, "strict", False):
+        failed += warned
+    tail = f"\n{passed}/{len(results)} 通过"
+    if warned:
+        tail += f"，{warned} 项告警（不阻断本地提交，但交付前应清零）"
+    print(tail)
+    return 0 if failed == 0 else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -888,8 +943,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("self-test", help="自检").set_defaults(func=cmd_self_test)
 
-    p_verify = sub.add_parser("verify", help="交付前总闸：自检 + 文档一致性 + 索引健康")
+    p_verify = sub.add_parser("verify", help="交付前总闸：自检 + 文档一致性 + 索引健康 + 异地副本")
     p_verify.add_argument("--skill", default=str(SKILL_PATH), help="技能文档路径（用于核对文档命令）")
+    p_verify.add_argument("--strict", action="store_true", help="告警项也视为失败（交付前用）")
     p_verify.set_defaults(func=cmd_verify)
 
     return parser
