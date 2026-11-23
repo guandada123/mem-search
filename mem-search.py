@@ -885,9 +885,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
     hook_ok, hook_detail = _hook_gate_status(root)
     results.append(("自动闸门在位", hook_ok, hook_detail, False))
 
-    # 6) 异地副本：git 只防误删，不防磁盘故障；本机 Time Machine 未配置
-    off_ok, off_detail = _offsite_status(root)
-    results.append(("异地副本已同步", off_ok, off_detail, True))
+    # 6) 异地副本：真源仓与技能文档仓可能不是同一个仓（2026-11-23 实测：确为两仓），都要断言
+    targets: list[tuple[str, Path | None]] = [("真源", root)]
+    skill_root = _repo_root_of(skill) if skill.is_file() else None
+    if skill_root is not None and skill_root != root:
+        targets.append(("技能", skill_root))
+    parts: list[str] = []
+    off_ok = True
+    for label, troot in targets:
+        ok, detail = _offsite_status(troot)
+        parts.append(f"{label} {detail}")
+        off_ok = off_ok and ok
+    if skill_root is None:
+        parts.append("技能文档不在 git 仓，未纳入比对")
+    results.append(("异地副本已同步", off_ok, "；".join(parts), True))
 
     passed = sum(1 for _, ok, _, _ in results if ok)
     warned = 0
