@@ -19,8 +19,8 @@
     similar   写新经验前查重；文本相似度 + 稀有种子覆盖双口径
     stats     索引规模与最新覆盖
     self-test 自检（分词/截断/掉线保护/查重端到端）
-    verify    交付前总闸：自检 + 文档命令与实现一致性 + 索引健康 + 版本控制 + 异地副本
-              （--strict：告警项也视为失败，交付前用）
+    verify    交付前总闸：自检 + 文档命令与实现一致性 + 索引健康（含源库逐段比对）
+              + 版本控制 + 异地副本（--strict：告警项也视为失败，交付前用）
 
 用法:
     mem-search.py index
@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -821,6 +822,81 @@ def _offsite_status(root: Path | None) -> tuple[bool, str]:
     return True, f"origin/main = {head[:7]}"
 
 
+def _sample_self_match(conn: sqlite3.Connection, n: int = 194, seed: int = 20261123) -> dict:
+    """抽样自匹配：随机取 n 个片段，用它自己最稀有的连续二元组查**全部**命中（不截断），
+    核对自身是否出现。测的是「每一行都真的可检索」，而不是「表里有这些行」。
+
+    为什么要这么做：`--limit` 截断后的结果集不能用来判覆盖（曾据此假报 65 篇漏索引）；
+    而只数 `count(*)` 又看不出内容是否切错。命中集过大的样本直接跳过，不做近似判断。
+    """
+    rng = random.Random(seed)
+    rows = conn.execute(
+        "SELECT c.lineno, c.text, d.path FROM chunks c JOIN docs d ON d.id = c.doc_id"
+    ).fetchall()
+    pool = list(rows)
+    rng.shuffle(pool)
+    checked = 0
+    miss: list[str] = []
+    for lineno, text, path in pool:
+        if checked >= n:
+            break
+        toks = seg(text).split()
+        if len(toks) < 4:
+            continue
+        best = None  # (df, phrase)：挑最稀有窗口，命中集才够小，「不在结果里」才有意义
+        for start in rng.sample(range(len(toks) - 1), min(4, len(toks) - 1)):
+            phrase = '"' + " ".join(toks[start:start + 2]) + '"'
+            df = conn.execute(
+                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?", (phrase,)
+            ).fetchone()[0]
+            if df and (best is None or df < best[0]):
+                best = (df, phrase)
+        if best is None:
+            continue
+        got = conn.execute(
+            "SELECT d.path, c.lineno FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+            "JOIN docs d ON d.id = c.doc_id WHERE chunks_fts MATCH ? LIMIT 5000",
+            (best[1],),
+        ).fetchall()
+        if len(got) >= 5000:
+            continue
+        checked += 1
+        if (path, lineno) not in set(got):
+            miss.append(f"{path}:{lineno}")
+    return {"checked": checked, "miss": miss}
+
+
+def _source_match(conn: sqlite3.Connection) -> dict:
+    """源文件与索引逐段比对：每篇文档重新解析一次，与库内 (lineno, text) 序列必须完全一致。
+
+    为什么不是「数片段数」：那样枚举的是**库内已有行**，一行 2 片被删成 1 片后
+    该行直接从候选集消失，闸门照样绿（本轮实测踩到）。这里枚举源文件，才看得见“少了”。
+    源文件比索引新（未刷新）时跳过，避免把「还没增量刷新」误报成丢数据。
+    """
+    docs = conn.execute("SELECT id, path, mtime FROM docs ORDER BY id").fetchall()
+    bad: list[str] = []
+    skipped = 0
+    for doc_id, path, mtime in docs:
+        p = Path(path)
+        try:
+            if p.stat().st_mtime > (mtime or 0) + 1:
+                skipped += 1
+                continue
+            fresh = read_chunks(p)
+        except OSError:
+            skipped += 1
+            continue
+        if fresh is None:
+            skipped += 1
+            continue
+        in_db = conn.execute(
+            "SELECT lineno, text FROM chunks WHERE doc_id=? ORDER BY id", (doc_id,)
+        ).fetchall()
+        if [tuple(r) for r in in_db] != fresh:
+            bad.append(f"{path} 源 {len(fresh)} 段/库 {len(in_db)} 段")
+    return {"docs": len(docs) - skipped, "bad": bad, "skipped": skipped}
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """交付前总闸：把「做完了」从主观判断改成七项可执行判据。"""
     # (名称, 通过, 详情, 仅告警) —— 仅告警项失败不算交付失败，但要显式打印
@@ -849,7 +925,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     results.append((f"脚本自带命令可执行（{len(doc_calls)} 条）", bool(doc_calls) and not doc_bad,
                     "; ".join(doc_bad[:4]) or ("全部存在" if doc_calls else "未解析到命令"), False))
 
-    # 3) 索引健康：非空 + 无 0 片段文档（0 片段 = 内容对检索不可见，是最隐蔽的假阴性）
+    # 3) 索引健康：非空 + 无 0 片段文档 + 抽样自匹配 + 长行切片完整
+    #    0 片段 = 内容对检索不可见；自匹配 = 每行真能查回来；切片 = 长行尾部没被截掉
     db = Path(args.db).expanduser()
     if not db.exists():
         results.append(("索引健康", False, "索引库不存在，先跑 index", False))
@@ -859,9 +936,25 @@ def cmd_verify(args: argparse.Namespace) -> int:
         empty = conn.execute(
             "SELECT count(*) FROM docs d WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.id)"
         ).fetchone()[0]
+        cover = _sample_self_match(conn)
+        sl = _source_match(conn)
         conn.close()
-        results.append(("索引健康（非空 + 无空文档）", docs > 0 and empty == 0,
-                        f"文档 {docs} 篇，0 片段 {empty} 篇", False))
+        n_ck, n_miss = cover["checked"], cover["miss"]
+        ok = docs > 0 and empty == 0 and n_ck > 0 and not n_miss and not sl["bad"]
+        detail = (
+            f"文档 {docs} 篇，0 片段 {empty} 篇，"
+            f"抽样自匹配 {n_ck - len(n_miss)}/{n_ck}，"
+            f"源库一致 {sl['docs']}/{docs}（不符 {len(sl['bad'])}）"
+        )
+        if sl["skipped"]:
+            detail += f"（跳 {sl['skipped']} 篇源已更新）"
+        if n_miss:
+            detail += "；漏检 " + "，".join(n_miss[:3])
+        if not n_ck:
+            detail += "；抽样为空，覆盖未验证"
+        if sl["bad"]:
+            detail += "；不一致 " + "，".join(sl["bad"][:2])
+        results.append(("索引健康（非空+可检索+源库一致）", ok, detail, False))
 
     # 4) 真源受版本控制：索引库可重建，脚本不可重建（902 行唯一副本 = 单点故障）
     src = Path(__file__).resolve()
