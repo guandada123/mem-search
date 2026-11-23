@@ -939,7 +939,7 @@ def main(argv: list[str] | None = None) -> int:
     except sqlite3.DatabaseError as exc:
         print(
             f"索引库不可用（可能是损坏或非 SQLite 文件）: {exc}\n"
-            f"库: {args.db}\n修复: 删除后重建 —— rm -f {args.db} && {Path(__file__).name} index",
+            f"库: {args.db}\n修复: 删除后重建 —— rm -f {args.db} && {Path(__file__).name} --db {args.db} index",
             file=sys.stderr,
         )
         return 2
