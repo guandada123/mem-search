@@ -1,0 +1,4 @@
+#!/bin/sh
+# 自动闸门：mem-search 改了但没过 verify 就不许提交。
+# 由 mem-search verify 的第 5 项断言本文件在位且被调用，丢了会变红。
+exec "$HOME/.local/share/mem-search/mem-search.py" verify
