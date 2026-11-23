@@ -897,7 +897,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
         parts.append(f"{label} {detail}")
         off_ok = off_ok and ok
     if skill_root is None:
-        parts.append("技能文档不在 git 仓，未纳入比对")
+        # 定位不到仓 ≠ 这一边没问题：可能是文档不在 git 仓，也可能是 git 探不到（如 TCC EPERM）。
+        # 两种情况下技能仓都没被验证，不能报绿——否则就是「覆盖不了仍亮绿灯」的静默漏检。
+        parts.append("技能文档所在仓无法定位（不在 git 仓或 git 不可用），该边未验证")
+        off_ok = False
     results.append(("异地副本已同步", off_ok, "；".join(parts), True))
 
     passed = sum(1 for _, ok, _, _ in results if ok)
